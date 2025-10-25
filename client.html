@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>JWT Client Tester</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        /* Custom styles to ensure the console output is the focus */
+        .container { min-height: 100vh; }
+        .log-area { max-height: 400px; overflow-y: scroll; font-family: monospace; }
+    </style>
+</head>
+<body class="bg-gray-100 p-8">
+
+    <div class="container mx-auto max-w-2xl bg-white p-6 rounded-xl shadow-2xl border border-gray-200">
+        <h1 class="text-3xl font-extrabold text-indigo-700 mb-4">
+            JWT Access/Refresh Flow Tester
+        </h1>
+        <p class="text-gray-600 mb-6">
+            This page demonstrates the client-side logic for the Access Token / HTTP-Only Refresh Token pattern.
+            <br>
+            <strong class="text-red-600">IMPORTANT:</strong> Open your browser's Developer Console (`F12` or `Ctrl+Shift+J`) to see the step-by-step token flow, especially the 65-second expiry and auto-refresh.
+        </p>
+
+        <div class="space-y-4">
+            <button id="runTestBtn" class="w-full bg-green-600 hover:bg-green-700 text-white font-bold py-3 px-4 rounded-lg shadow-lg transition duration-200 focus:outline-none focus:ring-4 focus:ring-green-500 focus:ring-opacity-50">
+                Start Full Authentication Test (Wait 65 seconds after initial success!)
+            </button>
+            <button id="logoutBtn" class="w-full bg-red-500 hover:bg-red-600 text-white font-bold py-2 px-4 rounded-lg shadow transition duration-200 focus:outline-none focus:ring-4 focus:ring-red-500 focus:ring-opacity-50">
+                Logout (Revoke Refresh Token)
+            </button>
+        </div>
+
+        <div class="mt-8">
+            <h2 class="text-xl font-semibold text-gray-700 mb-3">
+                Console Output Log
+            </h2>
+            <div id="log" class="log-area bg-gray-900 text-green-400 p-4 rounded-lg text-sm border border-gray-700">
+                Click "Start Full Authentication Test" to begin...
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // --- Setup ---
+        const API_BASE_URL = 'http://localhost:3000';
+        let currentAccessToken = null;
+        const logArea = document.getElementById('log');
+
+        const logMessage = (message, type = 'info') => {
+            const time = new Date().toLocaleTimeString();
+            let color = 'text-green-400';
+            if (type === 'error') color = 'text-red-400';
+            if (type === 'warn') color = 'text-yellow-400';
+
+            const newLine = document.createElement('div');
+            newLine.innerHTML = `<span class="text-gray-500">[${time}]</span> <span class="${color}">${message}</span>`;
+            logArea.appendChild(newLine);
+            logArea.scrollTop = logArea.scrollHeight;
+            console.log(message);
+        };
+
+        const setAccessToken = (token) => {
+            currentAccessToken = token;
+        };
+        
+        // -------------------------------------------------------------
+        // CORE REFRESH LOGIC
+        // -------------------------------------------------------------
+        
+        const refreshAccessToken = async () => {
+            logMessage('ATTEMPTING REFRESH: Sending request to /token/refresh (Refresh Token is in HTTP-Only cookie)...', 'warn');
+            try {
+                // NOTE: The Refresh Token (jwt cookie) is automatically sent by the browser.
+                const response = await fetch(`${API_BASE_URL}/token/refresh`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' }
+                });
+
+                if (response.status === 200) {
+                    const data = await response.json();
+                    setAccessToken(data.accessToken);
+                    logMessage('TOKEN REFRESH SUCCESS! New Access Token stored.', 'info');
+                    return data.accessToken;
+                } else {
+                    // Refresh Token failed (expired or invalid) - FORCE LOGOUT
+                    logMessage(`REFRESH FAILED (${response.status} ${response.statusText}). Forcing user logout.`, 'error');
+                    // In a real app, clear UI state and redirect to login page here.
+                    setAccessToken(null);
+                    return null;
+                }
+            } catch (error) {
+                logMessage('Refresh request failed due to network error.', 'error');
+                return null;
+            }
+        };
+
+        // -------------------------------------------------------------
+        // API CALL WRAPPER (Interceptor logic)
+        // -------------------------------------------------------------
+
+        const callProtectedApi = async (url, options = {}, retries = 0) => {
+            const headers = {
+                ...options.headers,
+                Authorization: `Bearer ${currentAccessToken}`,
+            };
+
+            try {
+                const response = await fetch(`${API_BASE_URL}${url}`, {
+                    ...options,
+                    headers,
+                });
+
+                // 1. Check for expired Access Token (401)
+                if (response.status === 401 && retries === 0) {
+                    logMessage('401 UNAUTHORIZED: Access Token expired or invalid. Triggering refresh...', 'warn');
+
+                    // 2. Attempt to get a new Access Token
+                    const newAccessToken = await refreshAccessToken();
+
+                    if (newAccessToken) {
+                        // 3. Retry the original request with the new token
+                        logMessage('Retrying original protected request with new Access Token...');
+                        // Update the options to include the new token for the retry
+                        options.headers = { ...options.headers, Authorization: `Bearer ${newAccessToken}` };
+                        return callProtectedApi(url, options, retries + 1);
+                    } else {
+                        // 4. Refresh failed, return original 401 response
+                        return response;
+                    }
+                }
+
+                // 5. Return successful response or any other error
+                return response;
+
+            } catch (error) {
+                logMessage('API call failed due to network error.', 'error');
+                throw error;
+            }
+        };
+        
+        // -------------------------------------------------------------
+        // FULL TEST WORKFLOW
+        // -------------------------------------------------------------
+        
+        async function runFullTestWorkflow() {
+            logArea.innerHTML = ''; // Clear logs
+            logMessage('STARTING TEST: Ensure server is running on localhost:3000.', 'info');
+
+            // 1. LOGIN
+            logMessage('1. Attempting POST /login...', 'info');
+            const loginResponse = await fetch(`${API_BASE_URL}/login`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                // This payload uses the exact correct username/password:
+                body: JSON.stringify({ username: 'testuser', password: 'password' }) 
+            });
+            
+            if (loginResponse.status !== 200) {
+                logMessage(`LOGIN FAILED (${loginResponse.status} ${loginResponse.statusText}). Please check your server console for errors.`, 'error');
+                try {
+                    const data = await loginResponse.text();
+                    logMessage(`Server response: ${data}`, 'error');
+                } catch {}
+                return;
+            }
+
+            const loginData = await loginResponse.json();
+            setAccessToken(loginData.accessToken);
+            logMessage('LOGIN SUCCESS! Access Token stored. HTTP-Only Refresh Token cookie set by browser.', 'info');
+
+            // 2. SUCCESSFUL ACCESS
+            logMessage('2. Initial Access: GET /protected with valid Access Token.', 'info');
+            let protectedResponse = await callProtectedApi('/protected', { method: 'GET' });
+            let protectedData = await protectedResponse.json();
+            logMessage(`Initial protected access successful: "${protectedData.message}"`, 'info');
+
+            // --- PAUSE FOR EXPIRY ---
+            logMessage('3. Waiting 65 seconds to allow Access Token to expire (Set to 1m on server)...', 'warn');
+            document.getElementById('runTestBtn').disabled = true;
+
+            // 3. EXPIRED ACCESS AND AUTOMATIC REFRESH
+            setTimeout(async () => {
+                logMessage('\n--- 65 SECONDS ELAPSED: Access Token is now expired ---', 'warn');
+                
+                logMessage('4. Attempting GET /protected (Expect 401 and auto-refresh attempt)...', 'info');
+                let refreshAttemptResponse = await callProtectedApi('/protected', { method: 'GET' });
+                
+                if (refreshAttemptResponse.status === 200) {
+                    let refreshAttemptData = await refreshAttemptResponse.json();
+                    logMessage(`5. SECOND ACCESS SUCCESSFUL via Auto-Refresh! Message: "${refreshAttemptData.message}"`, 'info');
+                } else {
+                    logMessage('5. Auto-Refresh failed. Test completed with error.', 'error');
+                }
+
+                document.getElementById('runTestBtn').disabled = false;
+            }, 65000); // 65 seconds
+        }
+
+        async function logoutUser() {
+            logMessage('\nAttempting POST /logout to clear Refresh Token...', 'warn');
+            try {
+                const response = await fetch(`${API_BASE_URL}/logout`, { method: 'POST' });
+                if (response.status === 204) {
+                    setAccessToken(null);
+                    logMessage('LOGOUT SUCCESS: Refresh Token revoked and cookie cleared.', 'info');
+                    document.getElementById('runTestBtn').disabled = false;
+                } else {
+                    logMessage(`LOGOUT FAILED (${response.status} ${response.statusText}).`, 'error');
+                }
+            } catch(e) {
+                logMessage('Logout request failed due to network error (Is the server running?).', 'error');
+            }
+        }
+
+        // Attach event listeners
+        document.getElementById('runTestBtn').addEventListener('click', runFullTestWorkflow);
+        document.getElementById('logoutBtn').addEventListener('click', logoutUser);
+
+    </script>
+</body>
+</html>
